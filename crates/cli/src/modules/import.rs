@@ -187,14 +187,23 @@ impl Iterator for GmailMessageIterator {
         // Read until we find a From line
         while let Ok(Some(line)) = self.read_line() {
             if line.starts_with(b"From ") {
-                // Parse date from From line
+                // Parse date from From line - skip the message ID part
                 if let Ok(date_str) = String::from_utf8(line[5..].to_vec()) {
-                    if let Some(date) = Self::parse_gmail_date(&date_str) {
-                        internal_date = date;
+                    // Find the first space after the message ID
+                    if let Some(date_start) = date_str.find(' ') {
+                        let date_str = &date_str[date_start + 1..];
+                        if let Some(date) = Self::parse_gmail_date(date_str) {
+                            internal_date = date;
+                        } else {
+                            return Some(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Invalid date format in From line: {}", date_str),
+                            )));
+                        }
                     } else {
                         return Some(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Invalid date format in From line: {}", date_str),
+                            "Invalid From line format - missing date",
                         )));
                     }
                 } else {
