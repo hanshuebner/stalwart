@@ -5203,6 +5203,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "quoted_printable"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a3866219251662ec3b26fc217e3e05bf9c4f84325234dfb96bf0bf840889e49"
+
+[[package]]
 name = "r2d2"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6665,6 +6671,7 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 name = "stalwart-cli"
 version = "0.11.7"
 dependencies = [
+ "chrono",
  "clap",
  "console",
  "csv",
@@ -6678,6 +6685,7 @@ dependencies = [
  "num_cpus",
  "prettytable-rs",
  "pwhash",
+ "quoted_printable",
  "rand 0.9.0",
  "reqwest 0.12.12",
  "rpassword",

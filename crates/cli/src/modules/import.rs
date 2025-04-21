@@ -44,7 +44,196 @@ use super::{
 enum Mailbox {
     Mbox(mbox::MessageIterator<Cursor<Vec<u8>>>),
     Maildir(maildir::MessageIterator),
+    Gmail(GmailMessageIterator),
     None,
+}
+
+struct GmailMessage {
+    identifier: String,
+    flags: Vec<maildir::Flag>,
+    thread_id: Option<String>,
+    internal_date: u64,
+    contents: Vec<u8>,
+}
+
+struct GmailMessageIterator {
+    reader: Cursor<Vec<u8>>,
+}
+
+impl GmailMessageIterator {
+    fn new(reader: Cursor<Vec<u8>>) -> Self {
+        Self {
+            reader,
+        }
+    }
+
+    fn parse_gmail_date(date_str: &str) -> Option<u64> {
+        // Parse Gmail's date format: "Mon Mar 01 08:13:51 +0000 2010"
+        let mut parts = date_str.split_whitespace();
+        let _day = parts.next()?; // Skip day of week
+        let month = parts.next()?;
+        let day = parts.next()?;
+        let time = parts.next()?;
+        let _tz = parts.next()?; // Skip timezone
+        let year = parts.next()?;
+
+        // Convert month name to number
+        let month_num = match month {
+            "Jan" => 1,
+            "Feb" => 2,
+            "Mar" => 3,
+            "Apr" => 4,
+            "May" => 5,
+            "Jun" => 6,
+            "Jul" => 7,
+            "Aug" => 8,
+            "Sep" => 9,
+            "Oct" => 10,
+            "Nov" => 11,
+            "Dec" => 12,
+            _ => return None,
+        };
+
+        // Parse time
+        let mut time_parts = time.split(':');
+        let hour = time_parts.next()?.parse::<u32>().ok()?;
+        let minute = time_parts.next()?.parse::<u32>().ok()?;
+        let second = time_parts.next()?.parse::<u32>().ok()?;
+
+        // Create DateTime
+        let date = chrono::NaiveDate::from_ymd_opt(
+            year.parse::<i32>().ok()?,
+            month_num,
+            day.parse::<u32>().ok()?,
+        )?;
+        let time = chrono::NaiveTime::from_hms_opt(hour, minute, second)?;
+        let datetime = chrono::NaiveDateTime::new(date, time);
+
+        Some(datetime.and_utc().timestamp() as u64)
+    }
+
+    fn parse_gmail_labels(header: &str) -> Vec<maildir::Flag> {
+        // Parse X-Gmail-Labels header with quoted-printable encoding
+        let mut flags = Vec::new();
+        if let Some(encoded) = header.strip_prefix("=?UTF-8?Q?") {
+            if let Some(rest) = encoded.strip_suffix("?=") {
+                if let Ok(decoded) = quoted_printable::decode(rest, quoted_printable::ParseMode::Robust) {
+                    if let Ok(labels_str) = String::from_utf8(decoded) {
+                        for label in labels_str.split(',') {
+                            match label.trim() {
+                                "\\Seen" => flags.push(maildir::Flag::Seen),
+                                "\\Answered" => flags.push(maildir::Flag::Replied),
+                                "\\Flagged" => flags.push(maildir::Flag::Flagged),
+                                "\\Deleted" => flags.push(maildir::Flag::Trashed),
+                                "\\Draft" => flags.push(maildir::Flag::Draft),
+                                "\\Passed" => flags.push(maildir::Flag::Passed),
+                                _ => {} // Ignore other labels
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        flags
+    }
+
+    fn read_line(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut line = Vec::new();
+        let mut prev_byte = 0u8;
+        let mut byte = [0u8; 1];
+
+        loop {
+            match std::io::Read::read_exact(&mut self.reader, &mut byte) {
+                Ok(_) => {
+                    line.push(byte[0]);
+                    
+                    // Check for CRLF
+                    if byte[0] == b'\n' && prev_byte == b'\r' {
+                        line.pop(); // Remove LF
+                        line.pop(); // Remove CR
+                        return Ok(Some(line));
+                    }
+                    
+                    prev_byte = byte[0];
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    if line.is_empty() {
+                        return Ok(None);
+                    } else {
+                        return Ok(Some(line));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Iterator for GmailMessageIterator {
+    type Item = io::Result<GmailMessage>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut message = Vec::new();
+        let mut flags = Vec::new();
+        let mut thread_id = None;
+        let mut internal_date = 0;
+
+        // Read until we find a From line
+        while let Ok(Some(line)) = self.read_line() {
+            if line.starts_with(b"From ") {
+                // Parse date from From line
+                if let Ok(date_str) = String::from_utf8(line[5..].to_vec()) {
+                    if let Some(date) = Self::parse_gmail_date(&date_str) {
+                        internal_date = date;
+                    }
+                }
+                break;
+            }
+        }
+
+        // Read message headers
+        while let Ok(Some(line)) = self.read_line() {
+            if line.is_empty() {
+                break; // End of headers
+            }
+            
+            if line.starts_with(b"X-Gmail-Labels: ") {
+                if let Ok(header) = String::from_utf8(line[15..].to_vec()) {
+                    flags = Self::parse_gmail_labels(&header);
+                }
+            } else if line.starts_with(b"X-GM-THRID: ") {
+                if let Ok(id) = String::from_utf8(line[12..].to_vec()) {
+                    thread_id = Some(id.trim().to_string());
+                }
+            }
+            
+            message.extend_from_slice(&line);
+            message.extend_from_slice(b"\r\n");
+        }
+
+        // Read message body
+        while let Ok(Some(line)) = self.read_line() {
+            if line.starts_with(b"From ") {
+                // Found next message, rewind
+                self.reader.set_position(self.reader.position() - (line.len() as u64 + 2));
+                break;
+            }
+            message.extend_from_slice(&line);
+            message.extend_from_slice(b"\r\n");
+        }
+
+        if message.is_empty() {
+            None
+        } else {
+            Some(Ok(GmailMessage {
+                identifier: format!("gmail-{}", internal_date),
+                flags,
+                thread_id,
+                internal_date,
+                contents: message,
+            }))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -83,6 +272,12 @@ impl ImportCommands {
                     MailboxFormat::Mbox => {
                         create_mailbox_names.push(Vec::new());
                         create_mailboxes.push(Mailbox::Mbox(MessageIterator::new(Cursor::new(
+                            read_file(&path),
+                        ))));
+                    }
+                    MailboxFormat::Gmail => {
+                        create_mailbox_names.push(Vec::new());
+                        create_mailboxes.push(Mailbox::Gmail(GmailMessageIterator::new(Cursor::new(
                             read_file(&path),
                         ))));
                     }
@@ -1035,6 +1230,17 @@ impl Iterator for Mailbox {
                     flags: m.flags().to_vec(),
                     internal_date: m.internal_date(),
                     contents: m.unwrap_contents(),
+                })
+            }),
+            Mailbox::Gmail(it) => it.next().map(|r| {
+                r.map(|m| Message {
+                    identifier: m.identifier,
+                    flags: m.flags,
+                    internal_date: m.internal_date,
+                    contents: m.contents,
+                })
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "Failed to parse from gmail file.")
                 })
             }),
             Mailbox::None => None,

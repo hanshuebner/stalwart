@@ -433,6 +433,8 @@ pub enum MailboxFormat {
     Maildir,
     /// Maildir with hierarchical folders (i.e. Dovecot)
     MaildirNested,
+    /// Gmail format
+    Gmail,
 }
 
 #[derive(Subcommand)]
