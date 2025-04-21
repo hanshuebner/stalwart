@@ -194,9 +194,14 @@ impl Iterator for GmailMessageIterator {
                     } else {
                         return Some(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("Failed to parse date from: {}", date_str),
+                            format!("Invalid date format in From line: {}", date_str),
                         )));
                     }
+                } else {
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Failed to decode From line as UTF-8",
+                    )));
                 }
                 break;
             }
@@ -211,10 +216,20 @@ impl Iterator for GmailMessageIterator {
             if line.starts_with(b"X-Gmail-Labels: ") {
                 if let Ok(header) = String::from_utf8(line[15..].to_vec()) {
                     flags = Self::parse_gmail_labels(&header);
+                } else {
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Failed to decode X-Gmail-Labels header as UTF-8",
+                    )));
                 }
             } else if line.starts_with(b"X-GM-THRID: ") {
                 if let Ok(id) = String::from_utf8(line[12..].to_vec()) {
                     thread_id = Some(id.trim().to_string());
+                } else {
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Failed to decode X-GM-THRID header as UTF-8",
+                    )));
                 }
             }
             
@@ -1250,8 +1265,11 @@ impl Iterator for Mailbox {
                     internal_date: m.internal_date,
                     contents: m.contents,
                 })
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "Failed to parse from gmail file.")
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed to parse Gmail message: {}", e),
+                    )
                 })
             }),
             Mailbox::None => None,
