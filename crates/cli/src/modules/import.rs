@@ -186,15 +186,16 @@ impl Iterator for GmailMessageIterator {
 
         // Read until we find a From line
         while let Ok(Some(line)) = self.read_line() {
-            eprintln!("Read line: {:?}", String::from_utf8_lossy(&line));
             if line.starts_with(b"From ") {
-                eprintln!("Found From line: {:?}", String::from_utf8_lossy(&line));
                 // Parse date from From line
                 if let Ok(date_str) = String::from_utf8(line[5..].to_vec()) {
-                    eprintln!("Parsing date from: {}", date_str);
                     if let Some(date) = Self::parse_gmail_date(&date_str) {
                         internal_date = date;
-                        eprintln!("Parsed date: {}", date);
+                    } else {
+                        return Some(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Failed to parse date from: {}", date_str),
+                        )));
                     }
                 }
                 break;
@@ -203,19 +204,16 @@ impl Iterator for GmailMessageIterator {
 
         // Read message headers
         while let Ok(Some(line)) = self.read_line() {
-            eprintln!("Reading header: {:?}", String::from_utf8_lossy(&line));
             if line.is_empty() {
                 break; // End of headers
             }
             
             if line.starts_with(b"X-Gmail-Labels: ") {
                 if let Ok(header) = String::from_utf8(line[15..].to_vec()) {
-                    eprintln!("Found X-Gmail-Labels: {}", header);
                     flags = Self::parse_gmail_labels(&header);
                 }
             } else if line.starts_with(b"X-GM-THRID: ") {
                 if let Ok(id) = String::from_utf8(line[12..].to_vec()) {
-                    eprintln!("Found X-GM-THRID: {}", id);
                     thread_id = Some(id.trim().to_string());
                 }
             }
@@ -236,10 +234,8 @@ impl Iterator for GmailMessageIterator {
         }
 
         if message.is_empty() {
-            eprintln!("No message content found");
             None
         } else {
-            eprintln!("Found complete message with {} bytes", message.len());
             Some(Ok(GmailMessage {
                 identifier: format!("gmail-{}", internal_date),
                 flags,
