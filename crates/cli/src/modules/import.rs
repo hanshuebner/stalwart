@@ -147,10 +147,16 @@ impl GmailMessageIterator {
                 Ok(_) => {
                     line.push(byte[0]);
                     
-                    // Check for CRLF
-                    if byte[0] == b'\n' && prev_byte == b'\r' {
-                        line.pop(); // Remove LF
-                        line.pop(); // Remove CR
+                    // Check for CRLF or LF
+                    if byte[0] == b'\n' {
+                        if prev_byte == b'\r' {
+                            // CRLF case
+                            line.pop(); // Remove LF
+                            line.pop(); // Remove CR
+                        } else {
+                            // LF case
+                            line.pop(); // Remove LF
+                        }
                         return Ok(Some(line));
                     }
                     
