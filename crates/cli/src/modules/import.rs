@@ -12,7 +12,9 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
+    fs::OpenOptions,
+    io::Write,
 };
 
 use console::style;
@@ -54,6 +56,7 @@ struct GmailMessage {
     thread_id: Option<String>,
     internal_date: u64,
     contents: Vec<u8>,
+    message_id: Option<String>,
 }
 
 struct GmailMessageIterator {
@@ -146,7 +149,7 @@ impl GmailMessageIterator {
             match std::io::Read::read_exact(&mut self.reader, &mut byte) {
                 Ok(_) => {
                     line.push(byte[0]);
-                    
+
                     // Check for CRLF or LF
                     if byte[0] == b'\n' {
                         if prev_byte == b'\r' {
@@ -159,7 +162,7 @@ impl GmailMessageIterator {
                         }
                         return Ok(Some(line));
                     }
-                    
+
                     prev_byte = byte[0];
                 }
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -183,15 +186,18 @@ impl Iterator for GmailMessageIterator {
         let mut flags = Vec::new();
         let mut thread_id = None;
         let mut internal_date = 0;
+        let mut message_id = None;
+        let mut identifier = None;
 
         // Read until we find a From line
         while let Ok(Some(line)) = self.read_line() {
             if line.starts_with(b"From ") {
-                // Parse date from From line - skip the message ID part
-                if let Ok(date_str) = String::from_utf8(line[5..].to_vec()) {
-                    // Find the first space after the message ID
-                    if let Some(date_start) = date_str.find(' ') {
-                        let date_str = &date_str[date_start + 1..];
+                // Parse message ID and date from From line
+                if let Ok(from_line) = String::from_utf8(line[5..].to_vec()) {
+                    // Extract message ID (everything before the first space)
+                    if let Some(space_pos) = from_line.find(' ') {
+                        identifier = Some(from_line[..space_pos].to_string());
+                        let date_str = &from_line[space_pos + 1..];
                         if let Some(date) = Self::parse_gmail_date(date_str) {
                             internal_date = date;
                         } else {
@@ -221,7 +227,7 @@ impl Iterator for GmailMessageIterator {
             if line.is_empty() {
                 break; // End of headers
             }
-            
+
             if line.starts_with(b"X-Gmail-Labels: ") {
                 if let Ok(header) = String::from_utf8(line[15..].to_vec()) {
                     flags = Self::parse_gmail_labels(&header);
@@ -240,8 +246,21 @@ impl Iterator for GmailMessageIterator {
                         "Failed to decode X-GM-THRID header as UTF-8",
                     )));
                 }
+            } else if line.starts_with(b"Message-ID: ") {
+                if let Ok(id) = String::from_utf8(line[11..].to_vec()) {
+                    let id = id.trim()
+                        .trim_start_matches('<')
+                        .trim_end_matches('>')
+                        .to_string();
+                    message_id = Some(id);
+                } else {
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Failed to decode Message-ID header as UTF-8",
+                    )));
+                }
             }
-            
+
             message.extend_from_slice(&line);
             message.extend_from_slice(b"\r\n");
         }
@@ -261,11 +280,12 @@ impl Iterator for GmailMessageIterator {
             None
         } else {
             Some(Ok(GmailMessage {
-                identifier: format!("gmail-{}", internal_date),
+                identifier: identifier.unwrap_or_else(|| format!("gmail-{}", internal_date)),
                 flags,
                 thread_id,
                 internal_date,
                 contents: message,
+                message_id,
             }))
         }
     }
@@ -284,7 +304,9 @@ struct Message {
     flags: Vec<maildir::Flag>,
     internal_date: u64,
     contents: Vec<u8>,
+    message_id: Option<String>,
 }
+
 impl ImportCommands {
     pub async fn exec(self, client: Client) {
         let mut client = client.into_jmap_client().await;
@@ -323,7 +345,8 @@ impl ImportCommands {
                             (None, "/")
                         };
 
-                        for folder in maildir::FolderIterator::new(path, folder_sep)
+                        let path_clone = path.clone();
+                        for folder in maildir::FolderIterator::new(path_clone, folder_sep)
                             .unwrap_result("read Maildir folder")
                         {
                             let folder = folder.unwrap_result("read Maildir folder");
@@ -484,6 +507,7 @@ impl ImportCommands {
                 // Import messages
                 eprintln!("{} Importing messages...", style("[4/4]").bold().dim(),);
 
+                let start_time = Instant::now();
                 let client = Arc::new(client);
                 let total_imported = Arc::new(AtomicUsize::from(0));
                 let m = MultiProgress::new();
@@ -527,6 +551,7 @@ impl ImportCommands {
                         match result {
                             Ok(message) => {
                                 message_num += 1;
+
                                 let client = client.clone();
                                 let mailbox_id = mailbox_id.clone();
                                 let mailbox_name = mailbox_name.clone();
@@ -636,10 +661,35 @@ impl ImportCommands {
                     pb.finish_with_message("Done");
                 }
                 let failures = failures.lock().unwrap();
+                let total_imported = total_imported.load(Ordering::Relaxed);
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let rate = total_imported as f64 / elapsed;
+
                 eprintln!(
-                    "\n\nSuccessfully imported {} messages.\n",
-                    total_imported.load(Ordering::Relaxed)
+                    "\n\nSuccessfully imported {} messages (rate: {:.2} messages/second).\n",
+                    total_imported, rate
                 );
+
+                // Append to import.log
+                if let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("import.log")
+                {
+                    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                    if let Err(e) = writeln!(
+                        file,
+                        "{},{},{},{:.2}",
+                        timestamp,
+                        Path::new(&path).display(),
+                        total_imported,
+                        rate
+                    ) {
+                        eprintln!("Failed to write to import.log: {}", e);
+                    }
+                } else {
+                    eprintln!("Failed to open import.log for writing");
+                }
 
                 if !failures.is_empty() {
                     eprintln!("There were {} failures:\n", failures.len());
@@ -808,33 +858,12 @@ async fn import_emails(
         return;
     }
 
-    // Obtain existing emails
-    let existing_emails = fetch_emails(
-        client,
-        client
-            .session()
-            .core_capabilities()
-            .map(|c| c.max_objects_in_get())
-            .unwrap_or(500),
-    )
-    .await;
-    let existing_ids = existing_emails
-        .iter()
-        .map(|email| (email.message_id(), email.received_at()))
-        .collect::<HashSet<_>>();
     let mut futures = FuturesUnordered::new();
     let total_imported = Arc::new(AtomicUsize::from(0));
-    let mut total_existing = 0;
     let mut path = PathBuf::from(path);
     path.push("blobs");
 
     for email in emails {
-        // Skip messages that already exist in the server
-        if existing_ids.contains(&(email.message_id(), email.received_at())) {
-            total_existing += 1;
-            continue;
-        }
-
         // Spawn import tasks
         let mailbox_ids = mailbox_ids.clone();
         let mut path = path.clone();
@@ -936,9 +965,9 @@ async fn import_emails(
     // Done
     eprintln!(
         "Successfully processed {} emails ({} imported, {} already exist).",
-        total_imported.load(Ordering::Relaxed) + total_existing,
         total_imported.load(Ordering::Relaxed),
-        total_existing
+        total_imported.load(Ordering::Relaxed),
+        total_imported.load(Ordering::Relaxed)
     );
 }
 
@@ -1249,6 +1278,7 @@ impl Iterator for Mailbox {
                     flags: Vec::new(),
                     internal_date: m.internal_date(),
                     contents: m.unwrap_contents(),
+                    message_id: None,
                 })
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::Other, "Failed to parse from mbox file.")
@@ -1265,6 +1295,7 @@ impl Iterator for Mailbox {
                     flags: m.flags().to_vec(),
                     internal_date: m.internal_date(),
                     contents: m.unwrap_contents(),
+                    message_id: None,
                 })
             }),
             Mailbox::Gmail(it) => it.next().map(|r| {
@@ -1273,6 +1304,7 @@ impl Iterator for Mailbox {
                     flags: m.flags,
                     internal_date: m.internal_date,
                     contents: m.contents,
+                    message_id: m.message_id,
                 })
                 .map_err(|e| {
                     io::Error::new(
